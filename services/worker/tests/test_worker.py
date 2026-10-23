@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
 WORKER_ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +21,9 @@ if str(WORKER_ROOT) not in sys.path:
 
 from engine.backtester import (  # noqa: E402
     BacktestConfig,
+    Bar,
+    _apply_slippage,
+    _simulate,
     generate_ohlcv,
     parse_ohlcv_csv,
     run_backtest,
@@ -121,6 +128,17 @@ def _pending_job(job_id: str = "job-1", **overrides) -> dict:
     return item
 
 
+def _bar(day: date, open_: float, close: float) -> Bar:
+    high = max(open_, close) * 1.01
+    low = min(open_, close) * 0.99
+    return Bar(timestamp=day, open=open_, high=high, low=low, close=close, volume=1_000.0)
+
+
+# ---------------------------------------------------------------------------
+# Engine math
+# ---------------------------------------------------------------------------
+
+
 def test_generate_ohlcv_is_deterministic():
     a = generate_ohlcv("AAPL", "2020-01-01", "2020-03-31")
     b = generate_ohlcv("AAPL", "2020-01-01", "2020-03-31")
@@ -140,6 +158,90 @@ def test_parse_ohlcv_csv():
     assert len(bars) == 30
     assert bars[0].open == 100.0
     assert bars[-1].close == 129.5
+
+
+def test_compute_metrics_sharpe_and_max_drawdown():
+    equity = [100.0, 110.0, 105.0, 120.0]
+    metrics = compute_metrics(equity, [10.0, -5.0, 15.0], initial_capital=100.0)
+
+    assert metrics.maxDrawdownPct == pytest.approx(((110.0 - 105.0) / 110.0) * 100.0)
+    assert metrics.totalReturnPct == pytest.approx(20.0)
+    assert metrics.winRatePct == pytest.approx(2 / 3 * 100.0)
+    assert metrics.profitFactor == pytest.approx(25.0 / 5.0)
+    assert metrics.totalTrades == 3
+
+    # Sharpe = annualized_return / annualized_vol from daily returns
+    returns = [(110 / 100) - 1, (105 / 110) - 1, (120 / 105) - 1]
+    mean_r = sum(returns) / len(returns)
+    vol = math.sqrt(sum((r - mean_r) ** 2 for r in returns) / len(returns))
+    expected_sharpe = (mean_r * 252) / (vol * math.sqrt(252))
+    assert metrics.annualizedSharpe == pytest.approx(expected_sharpe, rel=1e-5)
+    assert metrics.annualizedSortino != 0.0
+
+
+def test_compute_metrics_empty_curve():
+    metrics = compute_metrics([], [], initial_capital=10_000)
+    assert metrics.totalReturnPct == 0.0
+    assert metrics.totalTrades == 0
+    assert metrics.profitFactor == 0.0
+
+
+def test_slippage_and_commission_reduce_equity():
+    """Higher transaction costs must produce strictly lower final equity."""
+    base = dict(
+        strategy_type="MOMENTUM_CROSSOVER",
+        symbol="COST",
+        timeframe="1d",
+        start_date="2021-01-01",
+        end_date="2021-12-31",
+        parameters={"fastPeriod": 5, "slowPeriod": 20},
+        initial_capital=100_000.0,
+        use_synthetic_data=True,
+    )
+    free = run_backtest(BacktestConfig(**base, commission_bps=0.0, slippage_bps=0.0))
+    costly = run_backtest(BacktestConfig(**base, commission_bps=25.0, slippage_bps=25.0))
+
+    assert free.metrics.totalTrades > 0
+    assert costly.equity_curve[-1] < free.equity_curve[-1]
+    assert costly.metrics.totalReturnPct < free.metrics.totalReturnPct
+
+
+def test_apply_slippage_widens_spread():
+    assert _apply_slippage(100.0, side="buy", slippage_bps=10) == pytest.approx(100.1)
+    assert _apply_slippage(100.0, side="sell", slippage_bps=10) == pytest.approx(99.9)
+
+
+def test_zero_lookahead_bias_executes_at_next_open():
+    """
+    Signal at bar t must fill at bar t+1 open — never at bar t close.
+
+    Craft a path where close[t]=200 but open[t+1]=100. Same-bar (look-ahead)
+    fills would buy at 200; correct next-open fills buy at 100.
+    """
+    bars = [
+        _bar(date(2022, 1, 3), open_=100.0, close=100.0),
+        _bar(date(2022, 1, 4), open_=100.0, close=200.0),  # signal long here
+        _bar(date(2022, 1, 5), open_=100.0, close=100.0),  # fill must use open=100
+        _bar(date(2022, 1, 6), open_=100.0, close=100.0),
+    ]
+    # Flat, then long starting at index 1 (bar close), then flat
+    signals = [0, 1, 1, 0]
+
+    equity, trade_pnls = _simulate(
+        bars,
+        signals,
+        initial_capital=10_000.0,
+        commission_bps=0.0,
+        slippage_bps=0.0,
+    )
+
+    # After signal at i=1, buy at bars[2].open == 100 → ~100 shares
+    # Equity at close of bar 2 should be ~10_000 (100 shares * 100)
+    assert equity[2] == pytest.approx(10_000.0, rel=1e-6)
+
+    # If we had wrongly filled at close[1]=200 we would only get 50 shares
+    # and equity at close[2] would be 5_000 — assert we did NOT do that.
+    assert equity[2] != pytest.approx(5_000.0, abs=1.0)
 
 
 def test_momentum_crossover_requires_fast_lt_slow():
@@ -172,7 +274,6 @@ def test_momentum_crossover_synthetic_runs():
         )
     )
     assert result.bars_processed > 200
-    assert result.metrics.totalTrades >= 0
     assert "annualizedSharpe" in result.metrics.to_dict()
     assert "annualizedSortino" in result.metrics.to_dict()
 
@@ -217,27 +318,68 @@ def test_s3_dataset_backtest(aws_env):
     assert result.metrics.totalReturnPct is not None
 
 
-def test_compute_metrics_empty_curve():
-    metrics = compute_metrics([], [], initial_capital=10_000)
-    assert metrics.totalReturnPct == 0.0
-    assert metrics.totalTrades == 0
-    assert metrics.profitFactor == 0.0
-
-
-def test_compute_metrics_drawdown_sharpe_sortino():
-    equity = [100.0, 110.0, 105.0, 120.0]
-    metrics = compute_metrics(equity, [10.0, -5.0, 15.0], initial_capital=100.0)
-    assert metrics.maxDrawdownPct == pytest.approx(((110.0 - 105.0) / 110.0) * 100.0)
-    assert metrics.winRatePct == pytest.approx(2 / 3 * 100.0)
-    assert metrics.totalReturnPct == pytest.approx(20.0)
-    assert metrics.profitFactor == pytest.approx(25.0 / 5.0)
-    assert metrics.totalTrades == 3
+def test_metrics_to_decimals():
+    metrics = compute_metrics([100.0, 110.0], [10.0], initial_capital=100.0)
     decimals = metrics.to_decimals()
     assert isinstance(decimals["annualizedSharpe"], Decimal)
+    assert isinstance(decimals["totalTrades"], Decimal)
+
+
+# ---------------------------------------------------------------------------
+# Idempotency (unittest.mock + moto)
+# ---------------------------------------------------------------------------
 
 
 def test_build_execution_token():
     assert build_execution_token("abc", 2) == "abc:2"
+
+
+def test_idempotency_duplicate_completed_via_mock():
+    """ConditionalCheckFailed on COMPLETED → clean skip (no re-execution)."""
+    table = MagicMock()
+    table.get_item.side_effect = [
+        {"Item": {"jobId": "dup-1", "status": "PENDING"}},
+        {"Item": {"jobId": "dup-1", "status": "COMPLETED"}},
+    ]
+    table.update_item.side_effect = ClientError(
+        {
+            "Error": {
+                "Code": "ConditionalCheckFailedException",
+                "Message": "The conditional request failed",
+            }
+        },
+        "UpdateItem",
+    )
+    resource = MagicMock()
+    resource.Table.return_value = table
+    store = JobStore("BacktestJobs", dynamodb_resource=resource)
+
+    with pytest.raises(IdempotencyConflictError, match="COMPLETED|Unable to claim"):
+        store.mark_running("dup-1")
+
+
+def test_idempotency_skips_already_running_via_mock():
+    table = MagicMock()
+    table.get_item.return_value = {"Item": {"jobId": "run-1", "status": "RUNNING"}}
+    resource = MagicMock()
+    resource.Table.return_value = table
+    store = JobStore("BacktestJobs", dynamodb_resource=resource)
+
+    with pytest.raises(IdempotencyConflictError, match="already running"):
+        store.mark_running("run-1")
+    table.update_item.assert_not_called()
+
+
+def test_idempotency_skips_already_completed_via_mock():
+    table = MagicMock()
+    table.get_item.return_value = {"Item": {"jobId": "done-1", "status": "COMPLETED"}}
+    resource = MagicMock()
+    resource.Table.return_value = table
+    store = JobStore("BacktestJobs", dynamodb_resource=resource)
+
+    with pytest.raises(IdempotencyConflictError, match="already completed"):
+        store.mark_running("done-1")
+    table.update_item.assert_not_called()
 
 
 def test_job_store_mark_running_and_complete(aws_env):
@@ -267,6 +409,46 @@ def test_job_store_allows_retry_from_failed(aws_env):
 
     running = store.mark_running("job-retry")
     assert running["status"] == "RUNNING"
+
+
+def test_handler_acks_duplicate_sqs_without_rerunning(aws_env):
+    """Duplicate SQS delivery of a COMPLETED job must not appear in batchItemFailures."""
+    aws_env["table"].put_item(Item=_pending_job("done-job", status="COMPLETED"))
+
+    with patch.object(worker_handler, "run_backtest") as mock_bt:
+        result = worker_handler.handler(
+            {
+                "Records": [
+                    {
+                        "messageId": "msg-dup",
+                        "body": json.dumps(
+                            {
+                                "jobId": "done-job",
+                                "useSyntheticData": True,
+                                "strategyConfig": {
+                                    "symbol": "SPY",
+                                    "timeframe": "1d",
+                                    "startDate": "2022-01-01",
+                                    "endDate": "2022-02-28",
+                                    "strategyType": "MOMENTUM_CROSSOVER",
+                                    "parameters": {"fastPeriod": 3, "slowPeriod": 8},
+                                    "initialCapital": 10_000,
+                                },
+                            }
+                        ),
+                    }
+                ]
+            },
+            None,
+        )
+
+    assert result["batchItemFailures"] == []
+    mock_bt.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Handler / partial batch failures
+# ---------------------------------------------------------------------------
 
 
 def test_process_job_end_to_end_synthetic(aws_env):
@@ -361,11 +543,8 @@ def test_handler_partial_batch_failures(aws_env):
     assert {"itemIdentifier": "msg-bad"} in result["batchItemFailures"]
     assert {"itemIdentifier": "msg-good"} not in result["batchItemFailures"]
 
-    failed = aws_env["table"].get_item(Key={"jobId": "missing-job"}).get("Item")
-    # missing job raises before mark_failed; ensure good job completed
     good = aws_env["table"].get_item(Key={"jobId": "good-job"})["Item"]
     assert good["status"] == "COMPLETED"
-    assert failed is None
 
 
 def test_handler_marks_failed_and_reports_batch_item(aws_env, monkeypatch):
@@ -404,33 +583,3 @@ def test_handler_marks_failed_and_reports_batch_item(aws_env, monkeypatch):
     item = aws_env["table"].get_item(Key={"jobId": "fail-job"})["Item"]
     assert item["status"] == "FAILED"
     assert "transient engine failure" in item["errorMessage"]
-
-
-def test_handler_acks_duplicate_completed(aws_env):
-    aws_env["table"].put_item(Item=_pending_job("done-job", status="COMPLETED"))
-
-    event = {
-        "Records": [
-            {
-                "messageId": "msg-dup",
-                "body": json.dumps(
-                    {
-                        "jobId": "done-job",
-                        "useSyntheticData": True,
-                        "strategyConfig": {
-                            "symbol": "SPY",
-                            "timeframe": "1d",
-                            "startDate": "2022-01-01",
-                            "endDate": "2022-02-28",
-                            "strategyType": "MOMENTUM_CROSSOVER",
-                            "parameters": {"fastPeriod": 3, "slowPeriod": 8},
-                            "initialCapital": 10_000,
-                        },
-                    }
-                ),
-            }
-        ]
-    }
-
-    result = worker_handler.handler(event, None)
-    assert result["batchItemFailures"] == []

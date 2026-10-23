@@ -15,7 +15,7 @@
     "diff": "cdk diff"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.145",

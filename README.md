@@ -1,48 +1,47 @@
 # Cloud Backtesting Service
 
-Production-ready serverless quantitative backtesting platform on AWS. Submit strategy jobs through an HTTP API; a Python worker executes deterministic event-driven backtests and persists metrics to DynamoDB and S3.
+Production-ready serverless quantitative backtesting platform on AWS. Submit strategy jobs through a REST API; a Python worker executes event-driven backtests (S3 OHLCV or synthetic data) and persists metrics to DynamoDB.
 
 ## Architecture
 
 ```text
 Client
-  │  POST /backtests  ·  GET /backtests/{jobId}  ·  GET /health
+  │  POST /backtests  ·  GET /backtests/{jobId}
   ▼
-API Gateway (HTTP API)
+API Gateway (REST API)
   ▼
-API Lambda (TypeScript / Node.js 20)
-  ├── DynamoDB Jobs table (status + idempotency GSI)
-  └── SQS Job Queue ──► DLQ
+API Lambda (TypeScript / Node.js 22 / arm64)
+  ├── DynamoDB Jobs table (PENDING → RUNNING → COMPLETED|FAILED + TTL)
+  └── SQS BacktestQueue ──► BacktestDLQ
           ▼
-     Worker Lambda (Python 3.12)
-          ├── Backtesting engine (SMA / buy & hold / mean reversion)
-          ├── Idempotent claim (QUEUED → RUNNING → SUCCEEDED|FAILED)
-          └── S3 results bucket (JSON artifacts)
+     Worker Lambda (Python 3.12 / arm64)
+          ├── Idempotent claim (UpdateItem ConditionExpression)
+          ├── Engine (MEAN_REVERSION / MOMENTUM_CROSSOVER, t+1 fills)
+          └── S3 DatasetsBucket (datasets/{symbol}/{timeframe}.csv)
 
-CloudWatch alarms + ops dashboard via MonitoringConstruct
+CloudWatch: DLQDepthAlarm · WorkerErrorAlarm · ApiLatencyAlarm
 ```
 
 ### Components
 
 | Resource | Purpose |
 | --- | --- |
-| `HttpApi` | Public HTTP interface |
-| `ApiFunction` | Validates payloads (Zod), creates jobs, enqueues work |
-| `JobQueue` / DLQ | Decouples API latency from compute; poison-message isolation |
-| `WorkerFunction` | Runs strategies, writes results, reports partial batch failures |
-| `JobsTable` | Job lifecycle + idempotency key GSI + TTL |
-| `ResultsBucket` | Versioned, SSL-only result objects (90-day expiry) |
-| `MonitoringConstruct` | Error/latency/DLQ/age alarms + CloudWatch dashboard |
+| `RestApi` | `POST /backtests`, `GET /backtests/{jobId}` |
+| `ApiHandler` | Zod validation, creates `PENDING` jobs, enqueues SQS |
+| `BacktestQueue` / `BacktestDLQ` | Decouples API from compute; poison-message isolation |
+| `BacktestWorker` | Runs strategies, Decimal metrics, partial batch failures |
+| `JobsTable` | Job lifecycle + TTL (`ttl`) |
+| `DatasetsBucket` | Private, SSL-only OHLCV CSVs |
+| `MonitoringConstruct` | DLQ / worker error / API p99 latency alarms |
 
 ## Strategies
 
-| Name | Parameters | Behavior |
+| `strategyType` | Parameters | Behavior |
 | --- | --- | --- |
-| `sma_crossover` | `fastPeriod`, `slowPeriod` | Long when fast SMA crosses above slow |
-| `buy_and_hold` | — | Fully invested after first bar |
-| `mean_reversion` | `lookback`, `entryZ`, `exitZ` | Buy on deep negative z-score, exit near mean |
+| `MOMENTUM_CROSSOVER` | `fastPeriod`, `slowPeriod` | Long when fast SMA crosses above slow |
+| `MEAN_REVERSION` | `lookbackWindow`, `entryZScore`, `exitZScore` | Buy on deep negative z-score, exit near mean |
 
-Market data is a **deterministic synthetic OHLCV** series seeded by symbol so backtests are reproducible without an external market-data dependency.
+Signals at bar *t* execute at bar *t+1* open with `commissionBps` / `slippageBps`. Pass `useSyntheticData: true` in the SQS payload for deterministic tests without S3 data.
 
 ## API
 
@@ -50,35 +49,31 @@ Market data is a **deterministic synthetic OHLCV** series seeded by symbol so ba
 
 ```json
 {
-  "strategy": "sma_crossover",
-  "symbol": "AAPL",
+  "symbol": "SPY",
+  "timeframe": "1d",
   "startDate": "2020-01-01",
   "endDate": "2023-12-31",
-  "initialCapital": 100000,
+  "strategyType": "MOMENTUM_CROSSOVER",
   "parameters": { "fastPeriod": 10, "slowPeriod": 50 },
-  "idempotencyKey": "550e8400-e29b-41d4-a716-446655440000"
+  "initialCapital": 100000,
+  "commissionBps": 1,
+  "slippageBps": 2
 }
 ```
 
-Response `202`:
+Response `202 Accepted`:
 
 ```json
-{ "jobId": "...", "status": "QUEUED", "createdAt": "..." }
+{ "jobId": "...", "status": "PENDING", "pollUrl": "/backtests/{jobId}" }
 ```
-
-Pass `Idempotency-Key` as a header or `idempotencyKey` in the body to safely retry submissions.
 
 ### `GET /backtests/{jobId}`
 
-Returns job status, parameters, metrics (when succeeded), and `resultS3Key`.
-
-### `GET /health`
-
-Liveness probe for the API Lambda.
+Returns job status, `strategyConfig`, `datasetKey`, and `results` when `COMPLETED` (or `errorMessage` when `FAILED`). `404` if unknown.
 
 ## Prerequisites
 
-- Node.js 20+
+- Node.js 22+
 - Python 3.12+
 - AWS CDK CLI (`npx cdk`)
 - AWS credentials configured for deploy
@@ -98,7 +93,7 @@ python -m venv .venv
 # Windows: .venv\Scripts\activate
 source .venv/bin/activate
 pip install -r services/worker/requirements.txt
-pytest -q services/worker/tests
+pytest -q
 ```
 
 ## Deploy
@@ -109,11 +104,15 @@ npx cdk bootstrap   # once per account/region
 npx cdk deploy
 ```
 
-Stack outputs include `HttpApiUrl`, `JobsTableName`, `ResultsBucketName`, and `JobQueueUrl`.
+Stack outputs include `ApiUrl`, `JobsTableName`, `DatasetsBucketName`, and `BacktestQueueUrl`.
 
 ## CI/CD
 
-`.github/workflows/ci-cd.yml` runs TypeScript tests + `cdk synth`, Python `pytest`, and (on `main`) OIDC deploy via `AWS_ROLE_ARN`.
+`.github/workflows/ci-cd.yml`:
+
+1. `test-api-and-cdk` — Node 22, `npm test`, `npx cdk synth`
+2. `test-python-worker` — Python 3.12, `pytest`
+3. `deploy` — on `main` after both pass; AWS OIDC via `AWS_ROLE_ARN`, then `npx cdk deploy --require-approval never`
 
 ## Project layout
 
@@ -124,12 +123,12 @@ lib/constructs/monitoring-construct.ts
 services/api/                      TypeScript API Lambda
 services/worker/                   Python worker + engine
 test/backtesting-stack.test.ts     CDK assertions
+.github/workflows/ci-cd.yml        CI + OIDC deploy
 ```
 
 ## Security notes
 
 - S3 blocks public access and enforces SSL
-- DynamoDB uses AWS-managed encryption and PITR
 - Lambdas use least-privilege IAM grants from CDK
-- SQS uses managed encryption with a DLQ (`maxReceiveCount=3`)
-- X-Ray tracing is enabled on both functions
+- SQS DLQ with `maxReceiveCount=3`; visibility timeout ≥ 6× worker timeout
+- Worker claims jobs atomically; duplicate SQS deliveries are acked without re-running

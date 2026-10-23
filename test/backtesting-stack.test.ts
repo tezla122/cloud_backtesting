@@ -2,6 +2,10 @@ import * as cdk from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import { BacktestingStack } from '../lib/backtesting-stack';
 
+/** Worker timeout is 150s; SQS visibility must be >= 6× that (900s). */
+const WORKER_TIMEOUT_SECONDS = 150;
+const MIN_VISIBILITY_TIMEOUT_SECONDS = WORKER_TIMEOUT_SECONDS * 6;
+
 describe('BacktestingStack', () => {
   let template: Template;
 
@@ -11,6 +15,61 @@ describe('BacktestingStack', () => {
       env: { account: '111111111111', region: 'us-east-1' },
     });
     template = Template.fromStack(stack);
+  });
+
+  test('DynamoDB JobsTable has PAY_PER_REQUEST billing and TTL enabled', () => {
+    template.hasResourceProperties('AWS::DynamoDB::Table', {
+      BillingMode: 'PAY_PER_REQUEST',
+      KeySchema: Match.arrayWith([
+        Match.objectLike({ AttributeName: 'jobId', KeyType: 'HASH' }),
+      ]),
+      TimeToLiveSpecification: Match.objectLike({
+        AttributeName: 'ttl',
+        Enabled: true,
+      }),
+    });
+  });
+
+  test('SQS BacktestQueue is wired to DLQ with maxReceiveCount 3', () => {
+    template.resourceCountIs('AWS::SQS::Queue', 2);
+
+    template.hasResourceProperties('AWS::SQS::Queue', {
+      MessageRetentionPeriod: 1209600, // 14 days
+    });
+
+    template.hasResourceProperties('AWS::SQS::Queue', {
+      RedrivePolicy: Match.objectLike({
+        maxReceiveCount: 3,
+      }),
+    });
+  });
+
+  test('SQS visibility timeout is at least 6x the worker Lambda timeout', () => {
+    const queues = template.findResources('AWS::SQS::Queue');
+    const mainQueue = Object.values(queues).find(
+      (resource) => resource.Properties?.RedrivePolicy !== undefined,
+    );
+    expect(mainQueue).toBeDefined();
+    const visibility = mainQueue!.Properties.VisibilityTimeout as number;
+    expect(visibility).toBeGreaterThanOrEqual(MIN_VISIBILITY_TIMEOUT_SECONDS);
+
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Runtime: 'python3.12',
+      Timeout: WORKER_TIMEOUT_SECONDS,
+    });
+  });
+
+  test('CloudWatch alarms exist for DLQ depth and Worker errors', () => {
+    template.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      AlarmDescription: Match.stringLikeRegexp('DLQ'),
+      Threshold: 1,
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold',
+    });
+
+    template.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      AlarmDescription: Match.stringLikeRegexp('Worker'),
+      Period: 300,
+    });
   });
 
   test('creates private encrypted DatasetsBucket with SSL enforced', () => {
@@ -32,7 +91,6 @@ describe('BacktestingStack', () => {
       }),
     });
 
-    // enforceSSL attaches a Deny bucket policy for non-HTTPS
     template.hasResourceProperties('AWS::S3::BucketPolicy', {
       PolicyDocument: Match.objectLike({
         Statement: Match.arrayWith([
@@ -43,34 +101,6 @@ describe('BacktestingStack', () => {
             }),
           }),
         ]),
-      }),
-    });
-  });
-
-  test('creates DynamoDB JobsTable with jobId PK, PAY_PER_REQUEST, and TTL', () => {
-    template.hasResourceProperties('AWS::DynamoDB::Table', {
-      BillingMode: 'PAY_PER_REQUEST',
-      KeySchema: Match.arrayWith([
-        Match.objectLike({ AttributeName: 'jobId', KeyType: 'HASH' }),
-      ]),
-      TimeToLiveSpecification: Match.objectLike({
-        AttributeName: 'ttl',
-        Enabled: true,
-      }),
-    });
-  });
-
-  test('creates BacktestQueue wired to BacktestDLQ with 15m visibility', () => {
-    template.resourceCountIs('AWS::SQS::Queue', 2);
-
-    template.hasResourceProperties('AWS::SQS::Queue', {
-      MessageRetentionPeriod: 1209600, // 14 days
-    });
-
-    template.hasResourceProperties('AWS::SQS::Queue', {
-      VisibilityTimeout: 900, // 15 minutes
-      RedrivePolicy: Match.objectLike({
-        maxReceiveCount: 3,
       }),
     });
   });
@@ -123,23 +153,12 @@ describe('BacktestingStack', () => {
     });
   });
 
-  test('provisions DLQ, worker error, and API latency CloudWatch alarms', () => {
-    template.resourceCountIs('AWS::CloudWatch::Alarm', 3);
-
-    template.hasResourceProperties('AWS::CloudWatch::Alarm', {
-      AlarmDescription: Match.stringLikeRegexp('DLQ'),
-      Threshold: 1,
-      ComparisonOperator: 'GreaterThanOrEqualToThreshold',
-    });
-
-    template.hasResourceProperties('AWS::CloudWatch::Alarm', {
-      AlarmDescription: Match.stringLikeRegexp('Worker'),
-    });
-
+  test('provisions API Gateway p99 latency alarm at 1000ms', () => {
     template.hasResourceProperties('AWS::CloudWatch::Alarm', {
       AlarmDescription: Match.stringLikeRegexp('p99'),
       Threshold: 1000,
     });
+    template.resourceCountIs('AWS::CloudWatch::Alarm', 3);
   });
 
   test('exports the REST API URL', () => {
