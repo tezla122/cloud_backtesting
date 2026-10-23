@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 import boto3
@@ -13,7 +14,10 @@ logger = logging.getLogger(__name__)
 
 
 class IdempotencyConflictError(Exception):
-    """Raised when a job is already running or completed."""
+    """
+    Raised when a duplicate SQS delivery should be acknowledged without
+    re-running the backtest (job already RUNNING or COMPLETED).
+    """
 
 
 class JobStore:
@@ -33,37 +37,45 @@ class JobStore:
 
     def mark_running(self, job_id: str) -> dict[str, Any]:
         """
-        Transition QUEUED -> RUNNING atomically.
+        Atomically transition PENDING|FAILED → RUNNING.
 
-        Idempotent success path: if the job is already SUCCEEDED, return it
-        without reprocessing. Concurrent RUNNING/FAILED conflicts raise.
+        ConditionExpression only allows claiming when status is PENDING or
+        FAILED (safe retries) and explicitly excludes COMPLETED. Duplicate
+        deliveries that race a COMPLETED/RUNNING job raise
+        IdempotencyConflictError so the caller can ack the SQS message.
         """
         existing = self.get_job(job_id)
         if existing is None:
             raise KeyError(f"Job not found: {job_id}")
 
         status = existing.get("status")
-        if status == "SUCCEEDED":
-            logger.info("Skipping already-succeeded job", extra={"jobId": job_id})
-            return existing
+        if status == "COMPLETED":
+            logger.info(
+                "Duplicate delivery for completed job; skipping",
+                extra={"jobId": job_id, "status": status},
+            )
+            raise IdempotencyConflictError(f"Job already completed: {job_id}")
         if status == "RUNNING":
+            logger.info(
+                "Duplicate delivery for running job; skipping",
+                extra={"jobId": job_id, "status": status},
+            )
             raise IdempotencyConflictError(f"Job already running: {job_id}")
-        if status == "FAILED":
-            # Allow retry from FAILED by transitioning back to RUNNING
-            pass
-        elif status != "QUEUED":
-            raise IdempotencyConflictError(f"Unexpected job status {status}: {job_id}")
 
         try:
             response = self._table.update_item(
                 Key={"jobId": job_id},
-                UpdateExpression="SET #s = :running, updatedAt = :ts",
-                ConditionExpression="#s IN (:queued, :failed)",
+                UpdateExpression="SET #s = :running, updatedAt = :ts REMOVE errorMessage",
+                # PENDING or FAILED retries only; never claim COMPLETED
+                ConditionExpression=(
+                    "(#s = :pending OR #s = :failed) AND #s <> :completed"
+                ),
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={
                     ":running": "RUNNING",
-                    ":queued": "QUEUED",
+                    ":pending": "PENDING",
                     ":failed": "FAILED",
+                    ":completed": "COMPLETED",
                     ":ts": self._now(),
                 },
                 ReturnValues="ALL_NEW",
@@ -72,41 +84,43 @@ class JobStore:
         except ClientError as exc:
             if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 latest = self.get_job(job_id) or existing
-                if latest.get("status") == "SUCCEEDED":
-                    return latest
+                latest_status = latest.get("status")
+                logger.info(
+                    "Conditional claim failed; treating as duplicate delivery",
+                    extra={"jobId": job_id, "status": latest_status},
+                )
                 raise IdempotencyConflictError(
-                    f"Unable to claim job {job_id}; status={latest.get('status')}"
+                    f"Unable to claim job {job_id}; status={latest_status}"
                 ) from exc
             raise
 
-    def mark_succeeded(
+    def mark_completed(
         self,
         job_id: str,
         *,
-        metrics: dict[str, float],
-        result_s3_key: str,
+        results: dict[str, Decimal],
     ) -> dict[str, Any]:
+        """Persist Decimal metrics and transition RUNNING → COMPLETED."""
         response = self._table.update_item(
             Key={"jobId": job_id},
             UpdateExpression=(
-                "SET #s = :succeeded, updatedAt = :ts, #m = :metrics, "
-                "resultS3Key = :key REMOVE errorMessage"
+                "SET #s = :completed, updatedAt = :ts, results = :results "
+                "REMOVE errorMessage"
             ),
             ConditionExpression="#s = :running",
-            ExpressionAttributeNames={"#s": "status", "#m": "metrics"},
+            ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
-                ":succeeded": "SUCCEEDED",
+                ":completed": "COMPLETED",
                 ":running": "RUNNING",
                 ":ts": self._now(),
-                ":metrics": metrics,
-                ":key": result_s3_key,
+                ":results": results,
             },
             ReturnValues="ALL_NEW",
         )
-
         return response["Attributes"]
 
     def mark_failed(self, job_id: str, error_message: str) -> dict[str, Any]:
+        """Mark the job FAILED with a truncated error message (safe for retries)."""
         response = self._table.update_item(
             Key={"jobId": job_id},
             UpdateExpression="SET #s = :failed, updatedAt = :ts, errorMessage = :err",

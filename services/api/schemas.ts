@@ -1,31 +1,49 @@
 import { z } from 'zod';
 
-export const StrategyNameSchema = z.enum([
-  'sma_crossover',
-  'buy_and_hold',
-  'mean_reversion',
-]);
+export const TimeframeSchema = z.enum(['1m', '5m', '1h', '1d']);
+export type Timeframe = z.infer<typeof TimeframeSchema>;
 
-export type StrategyName = z.infer<typeof StrategyNameSchema>;
+export const StrategyTypeSchema = z.enum(['MEAN_REVERSION', 'MOMENTUM_CROSSOVER']);
+export type StrategyType = z.infer<typeof StrategyTypeSchema>;
 
+export const JobStatusSchema = z.enum(['PENDING', 'RUNNING', 'COMPLETED', 'FAILED']);
+export type JobStatus = z.infer<typeof JobStatusSchema>;
+
+const MeanReversionParametersSchema = z.object({
+  lookbackWindow: z.number().int().positive(),
+  entryZScore: z.number(),
+  exitZScore: z.number(),
+});
+
+const MomentumCrossoverParametersSchema = z.object({
+  fastPeriod: z.number().int().positive(),
+  slowPeriod: z.number().int().positive(),
+});
+
+/**
+ * POST /backtests request body.
+ * Parameters are strategy-specific; extra keys are rejected via .strict() on the unions.
+ */
 export const CreateBacktestRequestSchema = z
   .object({
-    strategy: StrategyNameSchema,
     symbol: z
       .string()
       .trim()
       .min(1)
-      .max(16)
-      .regex(/^[A-Za-z0-9.\-^]+$/, 'symbol must be alphanumeric'),
+      .max(32)
+      .regex(/^[A-Za-z0-9.\-^]+$/, 'symbol must be alphanumeric (e.g. BTC-USD, SPY)'),
+    timeframe: TimeframeSchema,
     startDate: z
       .string()
       .regex(/^\d{4}-\d{2}-\d{2}$/, 'startDate must be YYYY-MM-DD'),
     endDate: z
       .string()
       .regex(/^\d{4}-\d{2}-\d{2}$/, 'endDate must be YYYY-MM-DD'),
+    strategyType: StrategyTypeSchema,
+    parameters: z.record(z.union([z.number(), z.string(), z.boolean()])),
     initialCapital: z.number().positive().max(1_000_000_000).default(100_000),
-    parameters: z.record(z.union([z.number(), z.string(), z.boolean()])).default({}),
-    idempotencyKey: z.string().uuid().optional(),
+    commissionBps: z.number().min(0).max(10_000).default(0),
+    slippageBps: z.number().min(0).max(10_000).default(0),
   })
   .superRefine((value, ctx) => {
     const start = Date.parse(value.startDate);
@@ -44,63 +62,93 @@ export const CreateBacktestRequestSchema = z
         path: ['endDate'],
       });
     }
-    const spanDays = (end - start) / (1000 * 60 * 60 * 24);
-    if (spanDays > 3650) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'backtest window cannot exceed 10 years',
-        path: ['endDate'],
-      });
+
+    if (value.strategyType === 'MEAN_REVERSION') {
+      const parsed = MeanReversionParametersSchema.safeParse(value.parameters);
+      if (!parsed.success) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'MEAN_REVERSION requires lookbackWindow, entryZScore, and exitZScore',
+          path: ['parameters'],
+        });
+      }
+    } else if (value.strategyType === 'MOMENTUM_CROSSOVER') {
+      const parsed = MomentumCrossoverParametersSchema.safeParse(value.parameters);
+      if (!parsed.success) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'MOMENTUM_CROSSOVER requires fastPeriod and slowPeriod',
+          path: ['parameters'],
+        });
+        return;
+      }
+      if (parsed.data.fastPeriod >= parsed.data.slowPeriod) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'fastPeriod must be less than slowPeriod',
+          path: ['parameters', 'fastPeriod'],
+        });
+      }
     }
   });
 
 export type CreateBacktestRequest = z.infer<typeof CreateBacktestRequestSchema>;
 
-export const JobStatusSchema = z.enum([
-  'QUEUED',
-  'RUNNING',
-  'SUCCEEDED',
-  'FAILED',
-]);
+/** Nested strategy configuration stored on the DynamoDB job item. */
+export interface StrategyConfig {
+  symbol: string;
+  timeframe: Timeframe;
+  startDate: string;
+  endDate: string;
+  strategyType: StrategyType;
+  parameters: Record<string, number | string | boolean>;
+  initialCapital: number;
+  commissionBps: number;
+  slippageBps: number;
+}
 
-export type JobStatus = z.infer<typeof JobStatusSchema>;
+/** Performance metrics written by the worker when status === COMPLETED. */
+export interface BacktestResults {
+  totalReturnPct: number;
+  annualizedSharpe: number;
+  annualizedSortino: number;
+  maxDrawdownPct: number;
+  winRatePct: number;
+  profitFactor: number;
+  totalTrades: number;
+}
 
 export interface BacktestJobRecord {
   jobId: string;
   status: JobStatus;
-  strategy: StrategyName;
-  symbol: string;
-  startDate: string;
-  endDate: string;
-  initialCapital: number;
-  parameters: Record<string, number | string | boolean>;
-  idempotencyKey?: string;
+  strategyConfig: StrategyConfig;
+  datasetKey: string;
+  results?: BacktestResults;
+  errorMessage?: string;
   createdAt: string;
   updatedAt: string;
-  resultS3Key?: string;
-  metrics?: Record<string, number>;
-  errorMessage?: string;
-  ttl?: number;
+  ttl: number;
 }
 
 export interface CreateBacktestResponse {
   jobId: string;
-  status: JobStatus;
-  createdAt: string;
+  status: 'PENDING';
+  pollUrl: string;
 }
 
 export interface GetBacktestResponse {
   jobId: string;
   status: JobStatus;
-  strategy: StrategyName;
-  symbol: string;
-  startDate: string;
-  endDate: string;
-  initialCapital: number;
-  parameters: Record<string, number | string | boolean>;
+  strategyConfig: StrategyConfig;
+  datasetKey: string;
+  results?: BacktestResults;
+  errorMessage?: string;
   createdAt: string;
   updatedAt: string;
-  metrics?: Record<string, number>;
-  resultS3Key?: string;
-  errorMessage?: string;
+}
+
+/** Builds the S3 object key for an OHLCV dataset. */
+export function buildDatasetKey(symbol: string, timeframe: Timeframe): string {
+  return `datasets/${symbol.toUpperCase()}/${timeframe}.csv`;
 }

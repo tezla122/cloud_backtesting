@@ -1,29 +1,44 @@
-"""Performance metrics for equity curves and trade series."""
+"""Institutional quantitative performance metrics."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Sequence
+from decimal import Decimal
+from typing import Mapping, Sequence
 
 
 @dataclass(frozen=True)
 class PerformanceMetrics:
-    total_return: float
-    annualized_return: float
-    volatility: float
-    sharpe_ratio: float
-    max_drawdown: float
-    win_rate: float
-    trade_count: int
-    final_equity: float
-    initial_capital: float
+    totalReturnPct: float
+    annualizedSharpe: float
+    annualizedSortino: float
+    maxDrawdownPct: float
+    winRatePct: float
+    profitFactor: float
+    totalTrades: int
 
     def to_dict(self) -> dict[str, float]:
         return {key: float(value) for key, value in asdict(self).items()}
 
+    def to_decimals(self) -> dict[str, Decimal]:
+        """Convert floats to Decimal for DynamoDB persistence."""
+        return {
+            "totalReturnPct": Decimal(str(self.totalReturnPct)),
+            "annualizedSharpe": Decimal(str(self.annualizedSharpe)),
+            "annualizedSortino": Decimal(str(self.annualizedSortino)),
+            "maxDrawdownPct": Decimal(str(self.maxDrawdownPct)),
+            "winRatePct": Decimal(str(self.winRatePct)),
+            "profitFactor": Decimal(str(self.profitFactor)),
+            "totalTrades": Decimal(str(self.totalTrades)),
+        }
 
-def _daily_returns(equity_curve: Sequence[float]) -> list[float]:
+
+def floats_to_decimals(values: Mapping[str, float | int]) -> dict[str, Decimal]:
+    return {key: Decimal(str(value)) for key, value in values.items()}
+
+
+def _period_returns(equity_curve: Sequence[float]) -> list[float]:
     returns: list[float] = []
     for previous, current in zip(equity_curve, equity_curve[1:]):
         if previous <= 0:
@@ -33,7 +48,7 @@ def _daily_returns(equity_curve: Sequence[float]) -> list[float]:
     return returns
 
 
-def _max_drawdown(equity_curve: Sequence[float]) -> float:
+def _max_drawdown_pct(equity_curve: Sequence[float]) -> float:
     if not equity_curve:
         return 0.0
     peak = equity_curve[0]
@@ -45,58 +60,83 @@ def _max_drawdown(equity_curve: Sequence[float]) -> float:
             drawdown = (peak - value) / peak
             if drawdown > max_dd:
                 max_dd = drawdown
-    return max_dd
+    return max_dd * 100.0
+
+
+def _profit_factor(trade_pnls: Sequence[float]) -> float:
+    gross_profit = sum(pnl for pnl in trade_pnls if pnl > 0)
+    gross_loss = sum(-pnl for pnl in trade_pnls if pnl < 0)
+    if gross_loss < 1e-12:
+        return float("inf") if gross_profit > 0 else 0.0
+    return gross_profit / gross_loss
 
 
 def compute_metrics(
     equity_curve: Sequence[float],
     trade_pnls: Sequence[float],
     initial_capital: float,
-    trading_days_per_year: int = 252,
+    *,
+    periods_per_year: int = 252,
 ) -> PerformanceMetrics:
-    """Compute standard risk/return metrics from an equity curve."""
+    """
+    Compute risk/return metrics from an equity curve and closed-trade PnLs.
+
+    Returns percentages for return / drawdown / win-rate (e.g. 12.5 = 12.5%).
+    """
     if not equity_curve:
         return PerformanceMetrics(
-            total_return=0.0,
-            annualized_return=0.0,
-            volatility=0.0,
-            sharpe_ratio=0.0,
-            max_drawdown=0.0,
-            win_rate=0.0,
-            trade_count=0,
-            final_equity=float(initial_capital),
-            initial_capital=float(initial_capital),
+            totalReturnPct=0.0,
+            annualizedSharpe=0.0,
+            annualizedSortino=0.0,
+            maxDrawdownPct=0.0,
+            winRatePct=0.0,
+            profitFactor=0.0,
+            totalTrades=0,
         )
 
     final_equity = float(equity_curve[-1])
-    total_return = (final_equity - initial_capital) / initial_capital if initial_capital else 0.0
+    total_return_pct = (
+        ((final_equity - initial_capital) / initial_capital) * 100.0
+        if initial_capital
+        else 0.0
+    )
 
-    returns = _daily_returns(equity_curve)
+    returns = _period_returns(equity_curve)
     n = len(returns)
     if n == 0:
         mean_r = 0.0
         vol = 0.0
+        downside = 0.0
     else:
         mean_r = sum(returns) / n
         variance = sum((r - mean_r) ** 2 for r in returns) / n
         vol = math.sqrt(variance)
+        downside_sq = sum(min(r, 0.0) ** 2 for r in returns) / n
+        downside = math.sqrt(downside_sq)
 
-    annualized_vol = vol * math.sqrt(trading_days_per_year)
-    annualized_return = mean_r * trading_days_per_year
+    annualized_vol = vol * math.sqrt(periods_per_year)
+    annualized_downside = downside * math.sqrt(periods_per_year)
+    annualized_return = mean_r * periods_per_year
+
     sharpe = (annualized_return / annualized_vol) if annualized_vol > 1e-12 else 0.0
+    sortino = (
+        (annualized_return / annualized_downside) if annualized_downside > 1e-12 else 0.0
+    )
 
-    wins = sum(1 for pnl in trade_pnls if pnl > 0)
     trade_count = len(trade_pnls)
-    win_rate = (wins / trade_count) if trade_count else 0.0
+    wins = sum(1 for pnl in trade_pnls if pnl > 0)
+    win_rate_pct = (wins / trade_count * 100.0) if trade_count else 0.0
+    profit_factor = _profit_factor(trade_pnls)
+    if math.isinf(profit_factor):
+        # Cap for DynamoDB / JSON friendliness while remaining "very large"
+        profit_factor = 999.0
 
     return PerformanceMetrics(
-        total_return=round(total_return, 8),
-        annualized_return=round(annualized_return, 8),
-        volatility=round(annualized_vol, 8),
-        sharpe_ratio=round(sharpe, 8),
-        max_drawdown=round(_max_drawdown(equity_curve), 8),
-        win_rate=round(win_rate, 8),
-        trade_count=trade_count,
-        final_equity=round(final_equity, 4),
-        initial_capital=float(initial_capital),
+        totalReturnPct=round(total_return_pct, 6),
+        annualizedSharpe=round(sharpe, 6),
+        annualizedSortino=round(sortino, 6),
+        maxDrawdownPct=round(_max_drawdown_pct(equity_curve), 6),
+        winRatePct=round(win_rate_pct, 6),
+        profitFactor=round(profit_factor, 6),
+        totalTrades=trade_count,
     )

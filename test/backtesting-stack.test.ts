@@ -13,31 +13,16 @@ describe('BacktestingStack', () => {
     template = Template.fromStack(stack);
   });
 
-  test('creates DynamoDB jobs table with idempotency GSI', () => {
-    template.hasResourceProperties('AWS::DynamoDB::Table', {
-      BillingMode: 'PAY_PER_REQUEST',
-      KeySchema: Match.arrayWith([
-        Match.objectLike({ AttributeName: 'jobId', KeyType: 'HASH' }),
-      ]),
-      GlobalSecondaryIndexes: Match.arrayWith([
-        Match.objectLike({
-          IndexName: 'IdempotencyKeyIndex',
-          KeySchema: Match.arrayWith([
-            Match.objectLike({ AttributeName: 'idempotencyKey', KeyType: 'HASH' }),
-          ]),
-        }),
-      ]),
-      TimeToLiveSpecification: Match.objectLike({
-        AttributeName: 'ttl',
-        Enabled: true,
-      }),
-    });
-  });
-
-  test('creates encrypted results bucket that blocks public access', () => {
+  test('creates private encrypted DatasetsBucket with SSL enforced', () => {
     template.hasResourceProperties('AWS::S3::Bucket', {
       BucketEncryption: Match.objectLike({
-        ServerSideEncryptionConfiguration: Match.anyValue(),
+        ServerSideEncryptionConfiguration: Match.arrayWith([
+          Match.objectLike({
+            ServerSideEncryptionByDefault: Match.objectLike({
+              SSEAlgorithm: 'AES256',
+            }),
+          }),
+        ]),
       }),
       PublicAccessBlockConfiguration: Match.objectLike({
         BlockPublicAcls: true,
@@ -46,75 +31,121 @@ describe('BacktestingStack', () => {
         RestrictPublicBuckets: true,
       }),
     });
+
+    // enforceSSL attaches a Deny bucket policy for non-HTTPS
+    template.hasResourceProperties('AWS::S3::BucketPolicy', {
+      PolicyDocument: Match.objectLike({
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Effect: 'Deny',
+            Condition: Match.objectLike({
+              Bool: Match.objectLike({ 'aws:SecureTransport': 'false' }),
+            }),
+          }),
+        ]),
+      }),
+    });
   });
 
-  test('creates primary queue with DLQ redrive policy', () => {
+  test('creates DynamoDB JobsTable with jobId PK, PAY_PER_REQUEST, and TTL', () => {
+    template.hasResourceProperties('AWS::DynamoDB::Table', {
+      BillingMode: 'PAY_PER_REQUEST',
+      KeySchema: Match.arrayWith([
+        Match.objectLike({ AttributeName: 'jobId', KeyType: 'HASH' }),
+      ]),
+      TimeToLiveSpecification: Match.objectLike({
+        AttributeName: 'ttl',
+        Enabled: true,
+      }),
+    });
+  });
+
+  test('creates BacktestQueue wired to BacktestDLQ with 15m visibility', () => {
     template.resourceCountIs('AWS::SQS::Queue', 2);
+
     template.hasResourceProperties('AWS::SQS::Queue', {
+      MessageRetentionPeriod: 1209600, // 14 days
+    });
+
+    template.hasResourceProperties('AWS::SQS::Queue', {
+      VisibilityTimeout: 900, // 15 minutes
       RedrivePolicy: Match.objectLike({
         maxReceiveCount: 3,
       }),
     });
   });
 
-  test('creates API Node.js Lambda and Python worker Lambda', () => {
+  test('creates API Node.js 22 arm64 Lambda and Python 3.12 worker', () => {
     template.hasResourceProperties('AWS::Lambda::Function', {
-      Runtime: 'nodejs20.x',
+      Runtime: 'nodejs22.x',
+      Architectures: ['arm64'],
       Handler: 'index.handler',
-      Timeout: 29,
-      MemorySize: 512,
-      TracingConfig: { Mode: 'Active' },
+      Environment: Match.objectLike({
+        Variables: Match.objectLike({
+          JOBS_TABLE_NAME: Match.anyValue(),
+          QUEUE_URL: Match.anyValue(),
+        }),
+      }),
     });
 
     template.hasResourceProperties('AWS::Lambda::Function', {
       Runtime: 'python3.12',
+      Architectures: ['arm64'],
       Handler: 'handler.handler',
-      Timeout: 300,
+      Timeout: 150,
       MemorySize: 1024,
-      ReservedConcurrentExecutions: 20,
-      TracingConfig: { Mode: 'Active' },
+      Environment: Match.objectLike({
+        Variables: Match.objectLike({
+          JOBS_TABLE_NAME: Match.anyValue(),
+          DATASETS_BUCKET_NAME: Match.anyValue(),
+        }),
+      }),
     });
   });
 
-  test('worker is subscribed to the SQS job queue', () => {
+  test('worker is subscribed to BacktestQueue with batchSize 1', () => {
     template.hasResourceProperties('AWS::Lambda::EventSourceMapping', {
-      BatchSize: 5,
+      BatchSize: 1,
       FunctionResponseTypes: ['ReportBatchItemFailures'],
     });
   });
 
-  test('creates HTTP API with backtest and health routes', () => {
-    template.hasResourceProperties('AWS::ApiGatewayV2::Api', {
+  test('creates RestApi with POST /backtests and GET /backtests/{jobId}', () => {
+    template.hasResourceProperties('AWS::ApiGateway::RestApi', {
       Name: 'cloud-backtesting-api',
-      ProtocolType: 'HTTP',
     });
 
-    template.resourceCountIs('AWS::ApiGatewayV2::Route', 3);
-    template.hasResourceProperties('AWS::ApiGatewayV2::Route', {
-      RouteKey: 'POST /backtests',
+    template.hasResourceProperties('AWS::ApiGateway::Method', {
+      HttpMethod: 'POST',
     });
-    template.hasResourceProperties('AWS::ApiGatewayV2::Route', {
-      RouteKey: 'GET /backtests/{jobId}',
-    });
-    template.hasResourceProperties('AWS::ApiGatewayV2::Route', {
-      RouteKey: 'GET /health',
+    template.hasResourceProperties('AWS::ApiGateway::Method', {
+      HttpMethod: 'GET',
     });
   });
 
-  test('provisions CloudWatch alarms for API, worker, and DLQ', () => {
-    template.resourceCountIs('AWS::CloudWatch::Alarm', 5);
+  test('provisions DLQ, worker error, and API latency CloudWatch alarms', () => {
+    template.resourceCountIs('AWS::CloudWatch::Alarm', 3);
+
     template.hasResourceProperties('AWS::CloudWatch::Alarm', {
       AlarmDescription: Match.stringLikeRegexp('DLQ'),
+      Threshold: 1,
+      ComparisonOperator: 'GreaterThanOrEqualToThreshold',
     });
-    template.hasResourceProperties('AWS::CloudWatch::Dashboard', {
-      DashboardName: Match.stringLikeRegexp('ops'),
+
+    template.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      AlarmDescription: Match.stringLikeRegexp('Worker'),
+    });
+
+    template.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      AlarmDescription: Match.stringLikeRegexp('p99'),
+      Threshold: 1000,
     });
   });
 
-  test('exports the HTTP API URL', () => {
-    template.hasOutput('HttpApiUrl', {
+  test('exports the REST API URL', () => {
+    template.hasOutput('ApiUrl', {
       Export: Match.objectLike({
-        Name: 'TestBacktestingStack-HttpApiUrl',
+        Name: 'TestBacktestingStack-ApiUrl',
       }),
     });
   });
